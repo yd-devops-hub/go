@@ -6,7 +6,7 @@ on:
       - "install-go/**"
       - ".github/workflows/pr.yaml"
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - "install-go/**"
       - ".github/workflows/pr.yaml"
