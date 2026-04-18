@@ -1,0 +1,206 @@
+name: PR
+
+on:
+  pull_request:
+    paths:
+      - "install-go/**"
+      - ".github/workflows/pr.yaml"
+  push:
+    branches: [main, master]
+    paths:
+      - "install-go/**"
+      - ".github/workflows/pr.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  install-go:
+    name: ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Ubuntu 24.04
+            image: ubuntu:24.04
+            prep: "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates"
+            extra_args: ""
+
+          - distro: Ubuntu 22.04
+            image: ubuntu:22.04
+            prep: "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates"
+            extra_args: ""
+
+          - distro: Debian 12 (bookworm)
+            image: debian:12
+            prep: "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates"
+            extra_args: ""
+
+          - distro: Fedora 41
+            image: fedora:41
+            prep: "dnf -y install --allowerasing curl tar gzip"
+            extra_args: ""
+
+          - distro: Rocky Linux 9
+            image: rockylinux:9
+            prep: "dnf -y install --allowerasing curl tar gzip"
+            extra_args: ""
+
+          - distro: AlmaLinux 9
+            image: almalinux:9
+            prep: "dnf -y install --allowerasing curl tar gzip"
+            extra_args: ""
+
+          - distro: openSUSE Leap 15.6
+            image: opensuse/leap:15.6
+            prep: "zypper --non-interactive install -y curl tar gzip gawk"
+            extra_args: ""
+
+          - distro: Arch Linux
+            image: archlinux:latest
+            prep: "pacman -Sy --noconfirm --needed curl tar gzip gawk grep sed"
+            extra_args: ""
+
+          - distro: Alpine 3.20 (musl)
+            image: alpine:3.20
+            prep: "apk add --no-cache bash curl tar coreutils grep gawk sed"
+            extra_args: "--force"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test install-go.sh in ${{ matrix.distro }}
+        id: test
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          LOG_FILE="${GITHUB_WORKSPACE}/install-go-${{ strategy.job-index }}.log"
+
+          # The script is executed inside the target-distro container with
+          # /workspace bind-mounted to the checked-out repo. HOME=/root so the
+          # per-user install lands in /root/.local/go and we can verify it.
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            -e HOME=/root \
+            "${{ matrix.image }}" \
+            /bin/sh -eu -c '
+              ${{ matrix.prep }}
+              chmod +x install-go/install-go.sh
+              ./install-go/install-go.sh --user --no-shell-config ${{ matrix.extra_args }}
+              export PATH="/root/.local/go/bin:$PATH"
+              echo "---- go version ----"
+              go version
+              echo "---- go env GOROOT/GOPATH ----"
+              go env GOROOT GOPATH
+              echo "---- compile smoke test ----"
+              tmp="$(mktemp -d)"
+              cd "$tmp"
+              cat >hello.go <<EOF
+          package main
+          import "fmt"
+          func main() { fmt.Println("hello from Go") }
+          EOF
+              go run hello.go
+            ' 2>&1 | tee "$LOG_FILE"
+          status=${PIPESTATUS[0]}
+
+          # Extract the resolved "go version ..." line for the summary, if any.
+          go_version_line="$(grep -E '^go version ' "$LOG_FILE" | tail -n1 || true)"
+
+          {
+            echo "status=${status}"
+            echo "go_version=${go_version_line}"
+            echo "log_file=${LOG_FILE}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$status" -eq 0 ]; then
+            echo "result=PASS" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=FAIL" >> "$GITHUB_OUTPUT"
+          fi
+
+          exit "$status"
+
+      - name: Write step summary
+        if: always()
+        shell: bash
+        env:
+          DISTRO: ${{ matrix.distro }}
+          IMAGE: ${{ matrix.image }}
+          EXTRA_ARGS: ${{ matrix.extra_args }}
+          RESULT: ${{ steps.test.outputs.result }}
+          GO_VERSION_LINE: ${{ steps.test.outputs.go_version }}
+          LOG_FILE: ${{ steps.test.outputs.log_file }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -u
+          # If the test step never produced a result (e.g. it was cancelled or
+          # failed before setting outputs) fall back to the job status.
+          result="${RESULT:-}"
+          if [ -z "$result" ]; then
+            case "$JOB_STATUS" in
+              success) result="PASS" ;;
+              *)       result="FAIL" ;;
+            esac
+          fi
+
+          {
+            echo "### ${DISTRO} — ${result}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Image | \`${IMAGE}\` |"
+            echo "| Extra args | \`${EXTRA_ARGS:-(none)}\` |"
+            echo "| Result | **${result}** |"
+            if [ -n "${GO_VERSION_LINE:-}" ]; then
+              echo "| \`go version\` | \`${GO_VERSION_LINE}\` |"
+            fi
+            echo ""
+            echo "<details><summary>install-go.sh output</summary>"
+            echo ""
+            echo '```'
+            if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+              # Cap to the last ~500 lines to stay well under the 1 MiB summary limit.
+              tail -n 500 "$LOG_FILE"
+            else
+              echo "(no log captured)"
+            fi
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    name: Results summary
+    runs-on: ubuntu-latest
+    needs: install-go
+    if: always()
+    steps:
+      - name: Aggregate matrix results
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          set -euo pipefail
+
+          overall="${{ needs.install-go.result }}"
+
+          {
+            echo "# install-go.sh — cross-distro test results"
+            echo ""
+            echo "Overall matrix result: **${overall}**"
+            echo ""
+            echo "See each matrix job above for per-distro details (install log, resolved Go version, compile smoke test)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail the workflow if any matrix leg failed.
+          case "$overall" in
+            success) exit 0 ;;
+            *)       exit 1 ;;
+          esac
